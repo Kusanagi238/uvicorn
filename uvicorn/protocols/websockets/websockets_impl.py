@@ -157,7 +157,6 @@ class WebSocketProtocol(WebSocketServerProtocol):
             self.fail_connection(1012)
         else:
             self.send_500_response()
-        self.transport.close()
 
     def on_task_complete(self, task: asyncio.Task) -> None:
         self.tasks.discard(task)
@@ -264,7 +263,6 @@ class WebSocketProtocol(WebSocketServerProtocol):
                 self.send_500_response()
             else:
                 await self.handshake_completed_event.wait()
-            self.transport.close()
         else:
             self.closed_event.set()
             if not self.handshake_started_event.is_set():
@@ -275,7 +273,6 @@ class WebSocketProtocol(WebSocketServerProtocol):
                 msg = "ASGI callable should return None, but returned '%s'."
                 self.logger.error(msg, result)
                 await self.handshake_completed_event.wait()
-            self.transport.close()
 
     async def asgi_send(self, message: "ASGISendEvent") -> None:
         message_type = message["type"]

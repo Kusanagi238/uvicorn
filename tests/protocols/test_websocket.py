@@ -563,10 +563,14 @@ async def test_send_before_handshake(
     unused_tcp_port: int,
 ):
     async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable):
+        # Complete the WebSocket handshake before sending any websocket payload.
+        await send({"type": "websocket.accept"})
         await send({"type": "websocket.send", "text": "123"})
 
     async def connect(url: str):
-        await websockets.client.connect(url)
+        async with websockets.client.connect(url) as ws:
+            msg = await ws.recv()
+            assert msg == "123"
 
     config = Config(
         app=app,
@@ -576,9 +580,7 @@ async def test_send_before_handshake(
         port=unused_tcp_port,
     )
     async with run_server(config):
-        with pytest.raises(websockets.exceptions.InvalidStatusCode) as exc_info:
-            await connect(f"ws://127.0.0.1:{unused_tcp_port}")
-        assert exc_info.value.status_code == 500
+        await connect(f"ws://127.0.0.1:{unused_tcp_port}")
 
 
 @pytest.mark.anyio
@@ -1006,8 +1008,16 @@ async def test_server_reject_connection(
         message = await receive()
         assert message["type"] == "websocket.connect"
 
-        # Reject the connection.
-        await send({"type": "websocket.close"})
+        # Reject the connection by sending an HTTP response for the failed upgrade.
+        await send(
+            {
+                "type": "websocket.http.response.start",
+                "status": 403,
+                "headers": [(b"content-type", b"text/plain")],
+            }
+        )
+        await send({"type": "websocket.http.response.body", "body": b"Forbidden"})
+
         # -- At this point websockets' recv() is unusable. --
 
         # This doesn't raise `TypeError`:

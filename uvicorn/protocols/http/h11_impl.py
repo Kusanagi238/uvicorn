@@ -125,10 +125,18 @@ class H11Protocol(asyncio.Protocol):
         if self.conn.our_state != h11.ERROR:
             event = h11.ConnectionClosed()
             try:
-                self.conn.send(event)
+                output = self.conn.send(event)
             except h11.LocalProtocolError:
                 # Premature client disconnect
                 pass
+            else:
+                # Ensure any bytes produced by h11 are written out before closing
+                if output:
+                    try:
+                        self.transport.write(output)
+                    except Exception:
+                        # Transport may already be closing; ignore write errors
+                        pass
 
         if self.cycle is not None:
             self.cycle.message_event.set()
@@ -332,7 +340,13 @@ class H11Protocol(asyncio.Protocol):
         """
         if self.cycle is None or self.cycle.response_complete:
             event = h11.ConnectionClosed()
-            self.conn.send(event)
+            output = self.conn.send(event)
+            if output:
+                try:
+                    self.transport.write(output)
+                except Exception:
+                    # Transport may be closing; ignore write errors
+                    pass
             self.transport.close()
         else:
             self.cycle.keep_alive = False
@@ -356,7 +370,13 @@ class H11Protocol(asyncio.Protocol):
         """
         if not self.transport.is_closing():
             event = h11.ConnectionClosed()
-            self.conn.send(event)
+            output = self.conn.send(event)
+            if output:
+                try:
+                    self.transport.write(output)
+                except Exception:
+                    # Transport may be closing; ignore write errors
+                    pass
             self.transport.close()
 
 
@@ -515,7 +535,9 @@ class RequestResponseCycle:
 
         if self.response_complete:
             if self.conn.our_state is h11.MUST_CLOSE or not self.keep_alive:
-                self.conn.send(event=h11.ConnectionClosed())
+                output = self.conn.send(event=h11.ConnectionClosed())
+                if output:
+                    self.transport.write(output)
                 self.transport.close()
             self.on_response()
 

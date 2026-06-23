@@ -38,8 +38,8 @@ from uvicorn.protocols.utils import (
 )
 from uvicorn.server import ServerState
 
-HEADER_RE = re.compile(b'[\x00-\x1F\x7F()<>@,;:[]={} \t\\"]')
-HEADER_VALUE_RE = re.compile(b"[\x00-\x1F\x7F]")
+HEADER_RE = re.compile(b'[\x00-\x1f\x7f()<>@,;:[]={} \t\\"]')
+HEADER_VALUE_RE = re.compile(b"[\x00-\x1f\x7f]")
 
 
 def _get_status_line(status_code: int) -> bytes:
@@ -476,9 +476,8 @@ class RequestResponseCycle:
                 raise RuntimeError(msg % message_type)
             message = cast("HTTPResponseStartEvent", message)
 
-            self.response_started = True
-            self.waiting_for_100_continue = False
-
+            # Validate and build headers/content first. Only mark response as started
+            # after a successful write to the transport.
             status_code = message["status"]
             headers = self.default_headers + list(message.get("headers", []))
 
@@ -498,34 +497,61 @@ class RequestResponseCycle:
             # Write response status line and headers
             content = [STATUS_LINE[status_code]]
 
-            for name, value in headers:
-                if HEADER_RE.search(name):
-                    raise RuntimeError("Invalid HTTP header name.")
-                if HEADER_VALUE_RE.search(value):
-                    raise RuntimeError("Invalid HTTP header value.")
+            try:
+                for name, value in headers:
+                    if HEADER_RE.search(name):
+                        # Invalid header -> send 500 if possible
+                        await self.send_500_response()
+                        return
+                    if HEADER_VALUE_RE.search(value):
+                        await self.send_500_response()
+                        return
 
-                name = name.lower()
-                if name == b"content-length" and self.chunked_encoding is None:
-                    self.expected_content_length = int(value.decode())
-                    self.chunked_encoding = False
-                elif name == b"transfer-encoding" and value.lower() == b"chunked":
-                    self.expected_content_length = 0
+                    name = name.lower()
+                    if name == b"content-length" and self.chunked_encoding is None:
+                        try:
+                            self.expected_content_length = int(value.decode())
+                        except Exception:
+                            await self.send_500_response()
+                            return
+                        self.chunked_encoding = False
+                    elif name == b"transfer-encoding" and value.lower() == b"chunked":
+                        self.expected_content_length = 0
+                        self.chunked_encoding = True
+                    elif name == b"connection" and value.lower() == b"close":
+                        self.keep_alive = False
+                    content.extend([name, b": ", value, b"\r\n"])
+
+                if (
+                    self.chunked_encoding is None
+                    and self.scope["method"] != "HEAD"
+                    and status_code not in (204, 304)
+                ):
+                    # Neither content-length nor transfer-encoding specified
                     self.chunked_encoding = True
-                elif name == b"connection" and value.lower() == b"close":
-                    self.keep_alive = False
-                content.extend([name, b": ", value, b"\r\n"])
+                    content.append(b"transfer-encoding: chunked\r\n")
 
-            if (
-                self.chunked_encoding is None
-                and self.scope["method"] != "HEAD"
-                and status_code not in (204, 304)
-            ):
-                # Neither content-length nor transfer-encoding specified
-                self.chunked_encoding = True
-                content.append(b"transfer-encoding: chunked\r\n")
+                content.append(b"\r\n")
+                # Write to transport and only then consider the response started.
+                self.transport.write(b"".join(content))
+                self.response_started = True
+                self.waiting_for_100_continue = False
 
-            content.append(b"\r\n")
-            self.transport.write(b"".join(content))
+            except BaseException:
+                # Any unexpected error while preparing/writing headers -> try to
+                # send a 500 if response not yet started, otherwise close.
+                try:
+                    if not self.response_started:
+                        await self.send_500_response()
+                        return
+                finally:
+                    # If send_500_response itself fails or response already started
+                    # ensure the connection is closed cleanly.
+                    if not self.response_started:
+                        return
+                    await self.flow.drain()
+                    self.transport.close()
+                    return
 
         elif not self.response_complete:
             # Sending response body
@@ -550,7 +576,10 @@ class RequestResponseCycle:
             else:
                 num_bytes = len(body)
                 if num_bytes > self.expected_content_length:
-                    raise RuntimeError("Response content longer than Content-Length")
+                    # Protocol error after headers have been sent. Close gracefully.
+                    await self.flow.drain()
+                    self.transport.close()
+                    return
                 else:
                     self.expected_content_length -= num_bytes
                 self.transport.write(body)
@@ -558,10 +587,14 @@ class RequestResponseCycle:
             # Handle response completion
             if not more_body:
                 if self.expected_content_length != 0:
-                    raise RuntimeError("Response content shorter than Content-Length")
+                    # Protocol error: shorter than expected. Close gracefully.
+                    await self.flow.drain()
+                    self.transport.close()
+                    return
                 self.response_complete = True
                 self.message_event.set()
                 if not self.keep_alive:
+                    await self.flow.drain()
                     self.transport.close()
                 self.on_response()
 
